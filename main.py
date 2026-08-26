@@ -1,6 +1,6 @@
 """
 DigitalLifeEngine - 数字生命引擎
-V0.4：行为记录 + 主观状态采集 + 可解释状态推断 + 桌宠成长
+V0.5：可解释状态推断 + 长期用户画像 + 桌宠成长
 
 这是一个 AI 桌宠数字生命引擎。
 
@@ -22,6 +22,12 @@ V0.4 新增功能：
 - 结合当日指标和近期历史，推断充实、平稳、疲惫、压力偏高四种状态
 - 输出判断依据、个性化建议和供上层桌宠使用的反应代码
 - 拒绝 nan / inf 等非有限数字，历史分析不再依赖记录原有顺序
+
+V0.5 新增功能：
+- 根据全部历史记录生成可重算的长期用户画像
+- 区分长期平均特征和最近 7 条记录，避免只看单日状态
+- 输出画像成熟度、特征标签、主导状态和个性化陪伴策略
+- 每次新增或覆盖记录都会重算画像，不会因覆盖产生累计误差
 """
 
 
@@ -762,7 +768,249 @@ def show_historical_analysis(records):
 
 
 # ============================================================
-# 第五部分：桌宠成长系统（V0.3 新增）
+# 第五部分：长期用户画像（V0.5 新增）
+# ============================================================
+
+def calculate_field_average(records, field_name):
+    """计算记录中某个数值字段的平均值，缺失或无效字段会被忽略。"""
+
+    values = []
+    for record in records:
+        value = record.get(field_name)
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            values.append(value)
+
+    if not values:
+        return None
+
+    return round(sum(values) / len(values), 2)
+
+
+def find_dominant_state(records):
+    """统计最常出现的综合状态；并列时采用最近一次出现的状态。"""
+
+    allowed_states = {"充实", "平稳", "疲惫", "压力偏高"}
+    state_counts = {}
+
+    for record in records:
+        state = record.get("inferred_state")
+        if state in allowed_states:
+            state_counts[state] = state_counts.get(state, 0) + 1
+
+    if not state_counts:
+        return None, {}
+
+    highest_count = max(state_counts.values())
+    for record in reversed(records):
+        state = record.get("inferred_state")
+        if state_counts.get(state) == highest_count:
+            return state, state_counts
+
+    return None, state_counts
+
+
+def build_user_profile(records, updated_at):
+    """
+    根据历史记录重新生成长期用户画像。
+
+    画像是 records 的派生结果，不做增量累加。因此覆盖旧记录时，
+    只要再次调用本函数，画像就会自然修正，不需要额外“扣除画像”。
+    """
+
+    ordered_records = sorted(records, key=lambda record: record.get("date", ""))
+    recent_records = ordered_records[-7:]
+    subjective_records = [
+        record for record in ordered_records
+        if all(
+            isinstance(record.get(key), (int, float))
+            and math.isfinite(record[key])
+            for key in ("mood", "energy", "stress")
+        )
+    ]
+    recent_subjective_records = [
+        record for record in recent_records
+        if all(
+            isinstance(record.get(key), (int, float))
+            and math.isfinite(record[key])
+            for key in ("mood", "energy", "stress")
+        )
+    ]
+
+    subjective_days = len(subjective_records)
+    if subjective_days < 3:
+        maturity = "数据积累中"
+    elif subjective_days < 7:
+        maturity = "画像形成中"
+    else:
+        maturity = "画像较稳定"
+
+    dominant_state, state_distribution = find_dominant_state(ordered_records)
+
+    long_term = {
+        "avg_study_hours": calculate_field_average(ordered_records, "study_hours"),
+        "avg_game_minutes": calculate_field_average(ordered_records, "game_minutes"),
+        "avg_tasks_completed": calculate_field_average(ordered_records, "tasks_completed"),
+        "avg_interactions": calculate_field_average(ordered_records, "interactions"),
+        "avg_mood": calculate_field_average(subjective_records, "mood"),
+        "avg_energy": calculate_field_average(subjective_records, "energy"),
+        "avg_stress": calculate_field_average(subjective_records, "stress"),
+        "dominant_state": dominant_state
+    }
+
+    recent = {
+        "window_size": len(recent_records),
+        "avg_study_hours": calculate_field_average(recent_records, "study_hours"),
+        "avg_tasks_completed": calculate_field_average(recent_records, "tasks_completed"),
+        "avg_interactions": calculate_field_average(recent_records, "interactions"),
+        "avg_mood": calculate_field_average(recent_subjective_records, "mood"),
+        "avg_energy": calculate_field_average(recent_subjective_records, "energy"),
+        "avg_stress": calculate_field_average(recent_subjective_records, "stress")
+    }
+
+    traits = []
+    if subjective_days < 3:
+        traits.append("画像数据仍在积累")
+    else:
+        if (long_term["avg_study_hours"] is not None
+                and long_term["avg_study_hours"] >= 4):
+            traits.append("学习投入较高")
+        elif (long_term["avg_study_hours"] is not None
+              and long_term["avg_study_hours"] <= 1):
+            traits.append("偏好轻量学习节奏")
+
+        if (long_term["avg_tasks_completed"] is not None
+                and long_term["avg_tasks_completed"] >= 3):
+            traits.append("任务执行力较强")
+
+        if (long_term["avg_interactions"] is not None
+                and long_term["avg_interactions"] >= 5):
+            traits.append("乐于与桌宠互动")
+        elif (long_term["avg_interactions"] is not None
+              and long_term["avg_interactions"] <= 1):
+            traits.append("更偏好低频陪伴")
+
+        if (long_term["avg_stress"] is not None
+                and long_term["avg_stress"] >= 3.8):
+            traits.append("长期压力水平偏高")
+        if (long_term["avg_energy"] is not None
+                and long_term["avg_energy"] <= 2.5):
+            traits.append("精力恢复可能不足")
+        if (long_term["avg_mood"] is not None
+                and long_term["avg_mood"] >= 4):
+            traits.append("整体心情较积极")
+
+    recent_stress = recent["avg_stress"]
+    recent_energy = recent["avg_energy"]
+    recent_mood = recent["avg_mood"]
+
+    if subjective_days < 3:
+        care_strategy = {
+            "mode": "observe",
+            "preferred_reaction": "encourage",
+            "task_difficulty": 1,
+            "message": "继续温和记录，暂不根据少量数据下长期结论"
+        }
+    elif recent_stress is not None and recent_stress >= 3.8:
+        care_strategy = {
+            "mode": "reduce_load",
+            "preferred_reaction": "comfort",
+            "task_difficulty": 1,
+            "message": "近期压力偏高，优先推荐低负担放松任务"
+        }
+    elif recent_energy is not None and recent_energy <= 2.5:
+        care_strategy = {
+            "mode": "recovery",
+            "preferred_reaction": "rest",
+            "task_difficulty": 1,
+            "message": "近期精力偏低，优先保证休息和恢复"
+        }
+    elif (recent_mood is not None and recent_mood >= 4
+          and recent_energy is not None and recent_energy >= 3.5):
+        care_strategy = {
+            "mode": "growth",
+            "preferred_reaction": "celebrate",
+            "task_difficulty": 3,
+            "message": "近期状态良好，可以推荐适度挑战型成长任务"
+        }
+    else:
+        care_strategy = {
+            "mode": "steady",
+            "preferred_reaction": "encourage",
+            "task_difficulty": 2,
+            "message": "保持当前节奏，提供稳定且适量的日常任务"
+        }
+
+    if subjective_days < 3:
+        summary = f"已积累 {subjective_days}/3 天主观状态数据，画像正在形成"
+    elif traits:
+        summary = "；".join(traits[:3])
+    else:
+        summary = "长期数据整体较为均衡"
+
+    return {
+        "version": 1,
+        "updated_at": updated_at,
+        "sample_size": {
+            "total_days": len(ordered_records),
+            "subjective_days": subjective_days
+        },
+        "maturity": maturity,
+        "summary": summary,
+        "traits": traits,
+        "state_distribution": state_distribution,
+        "long_term": long_term,
+        "recent_7_records": recent,
+        "care_strategy": care_strategy
+    }
+
+
+def apply_profile_to_recommendation(record, profile):
+    """把长期画像策略附加到今日建议中，供上层界面直接读取。"""
+
+    recommendation = record["recommendation"]
+    strategy = profile["care_strategy"]
+    recommendation["profile_context"] = strategy["message"]
+
+    # 压力或疲惫状态下只降低难度，不用长期画像强行增加任务负担
+    if record["inferred_state"] in ("压力偏高", "疲惫"):
+        recommendation["difficulty"] = min(
+            recommendation["difficulty"], strategy["task_difficulty"]
+        )
+    elif profile["maturity"] != "数据积累中":
+        recommendation["difficulty"] = strategy["task_difficulty"]
+
+
+def show_user_profile(profile):
+    """在命令行显示长期用户画像摘要。"""
+
+    print()
+    print("=" * 40)
+    print("       长期用户画像")
+    print("=" * 40)
+    print(f"画像成熟度：{profile['maturity']}")
+    print(f"累计样本：{profile['sample_size']['total_days']} 天")
+    print(f"主观状态样本：{profile['sample_size']['subjective_days']} 天")
+    print(f"画像摘要：{profile['summary']}")
+
+    long_term = profile["long_term"]
+    if long_term["dominant_state"] is not None:
+        print(f"长期主导状态：{long_term['dominant_state']}")
+    if long_term["avg_mood"] is not None:
+        print(f"长期平均心情：{long_term['avg_mood']:.1f} / 5")
+        print(f"长期平均精力：{long_term['avg_energy']:.1f} / 5")
+        print(f"长期平均压力：{long_term['avg_stress']:.1f} / 5")
+
+    if profile["traits"]:
+        print("画像标签：" + "、".join(profile["traits"]))
+
+    strategy = profile["care_strategy"]
+    print(f"陪伴模式：{strategy['mode']}")
+    print(f"陪伴策略：{strategy['message']}")
+    print("=" * 40)
+
+
+# ============================================================
+# 第六部分：桌宠成长系统（V0.3 新增）
 # ============================================================
 
 def calculate_daily_xp(record, consecutive_days):
@@ -995,7 +1243,7 @@ def show_pet_status(pet, daily_xp_change, daily_intimacy_change,
 
 
 # ============================================================
-# 第六部分：主程序
+# 第七部分：主程序
 # ============================================================
 
 def pause_before_exit():
@@ -1021,12 +1269,11 @@ def main():
     4. 整理今天的完整记录
     5. 加载桌宠数据
     6. 如果今天已有记录，询问用户是否覆盖
-    7. 计算今日 XP 和亲密度，更新桌宠成长数据
-    8. 保存数据（行为记录和桌宠数据一起保存）
-    9. 显示今日分析结果
-    10. 显示桌宠状态（V0.3 新增）
-    11. 显示历史表现分析
-    12. 暂停，等用户按 Enter 键再退出
+    7. 根据全部记录重新生成长期用户画像
+    8. 计算今日 XP 和亲密度，更新桌宠成长数据
+    9. 保存行为、桌宠与用户画像数据
+    10. 显示今日分析、桌宠状态、历史分析和长期画像
+    11. 暂停，等用户按 Enter 键再退出
     """
 
     # ---- 第一步：获取用户输入 ----
@@ -1116,7 +1363,13 @@ def main():
         # 今天还没有记录，正常追加新记录
         records.append(today_record)
 
-    # ---- 第六步：计算 XP 和亲密度，更新桌宠成长数据 ----
+    # ---- 第六步：重新生成长期用户画像 ----
+    # 画像完全由 records 推导，所以新增与覆盖使用同一套逻辑。
+    user_profile = build_user_profile(records, today)
+    data["user_profile"] = user_profile
+    apply_profile_to_recommendation(today_record, user_profile)
+
+    # ---- 第七步：计算 XP 和亲密度，更新桌宠成长数据 ----
     # 计算连续记录天数（此时今天的记录已经加入列表）
     consecutive_days = calculate_consecutive_days(records)
 
@@ -1148,10 +1401,10 @@ def main():
     daily_xp_change = pet["xp"] - xp_before
     daily_intimacy_change = pet["intimacy"] - intimacy_before
 
-    # ---- 第七步：保存数据（行为记录和桌宠数据一起保存）----
+    # ---- 第八步：保存行为、桌宠和画像数据 ----
     save_data(data)
 
-    # ---- 第八步：显示今日分析结果 ----
+    # ---- 第九步：显示今日分析结果 ----
     print("=" * 40)
     print("       今日分析结果")
     print("=" * 40)
@@ -1168,6 +1421,7 @@ def main():
     for reason in state_result["reasons"]:
         print(f"  - {reason}")
     print(f"今日建议：{state_result['recommendation']['title']}")
+    print(f"画像参考：{state_result['recommendation']['profile_context']}")
     print(f"桌宠反应：{state_result['pet_reaction']}")
     print("=" * 40)
 
@@ -1180,15 +1434,16 @@ def main():
     print(f"数据文件：{DATA_FILE}")
     print(f"累计记录天数：{len(data['records'])}")
 
-    # ---- 第九步：显示桌宠状态（V0.3 新增）----
+    # ---- 第十步：显示桌宠状态（V0.3 新增）----
     show_pet_status(pet, daily_xp_change, daily_intimacy_change,
                     old_level, new_level,
                     is_correction=(old_record is not None))
 
-    # ---- 第十步：显示历史表现分析 ----
+    # ---- 第十一步：显示历史表现分析和长期画像 ----
     show_historical_analysis(data["records"])
+    show_user_profile(user_profile)
 
-    # ---- 第十一步：暂停，等用户按 Enter 键再退出 ----
+    # ---- 第十二步：暂停，等用户按 Enter 键再退出 ----
     pause_before_exit()
 
 
