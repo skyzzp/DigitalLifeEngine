@@ -1,6 +1,6 @@
 """
 DigitalLifeEngine - 数字生命引擎
-V0.3：每日行为记录与分析 + 历史数据分析 + 桌宠成长系统
+V0.4：行为记录 + 主观状态采集 + 可解释状态推断 + 桌宠成长
 
 这是一个 AI 桌宠数字生命引擎。
 
@@ -16,10 +16,17 @@ V0.3 新增功能：
 - 桌宠成长系统：根据每天的行为数据获得 XP（经验值）、提升等级、增加亲密度
 - 等级提升时会显示升级提示
 - 数据文件新增 pet 区域，旧数据文件没有 pet 字段也能正常使用
+
+V0.4 新增功能：
+- 记录心情、精力、压力三个 1～5 分的主观指标
+- 结合当日指标和近期历史，推断充实、平稳、疲惫、压力偏高四种状态
+- 输出判断依据、个性化建议和供上层桌宠使用的反应代码
+- 拒绝 nan / inf 等非有限数字，历史分析不再依赖记录原有顺序
 """
 
 
 import json        # 用于读写 JSON 数据文件
+import math        # 用于判断输入是否为有限数字
 import os          # 用于检查文件和创建目录
 from datetime import datetime  # 用于获取今天的日期、做日期计算
 
@@ -84,20 +91,24 @@ LEVEL_TABLE = [
 # 第一部分：用户输入
 # ============================================================
 
-def ask_positive_number(prompt, allow_decimal=True):
+def ask_positive_number(prompt, allow_decimal=True,
+                        min_value=0, max_value=None):
     """
     向用户询问一个数字，并做合法性检查。
 
     检查规则：
     1. 输入必须是数字（否则提示重新输入）
-    2. 数字不能小于 0（否则提示重新输入）
+    2. 数字必须是有限值，不能是 nan 或 inf
+    3. 数字必须处于指定范围
 
     参数：
     - prompt - 提示文字，例如 "今天学习了几小时？ "
     - allow_decimal - True 表示允许小数（如 2.5），
                       False 表示只接受整数
 
-    返回：一个合法的数字（大于等于 0）
+    - min_value / max_value - 可接受范围；max_value 为 None 表示无上限
+
+    返回：一个合法数字
     """
 
     # while True 会一直循环，
@@ -124,9 +135,19 @@ def ask_positive_number(prompt, allow_decimal=True):
                 print("  输入无效，请输入一个整数。")
             continue
 
-        # 检查数字是否小于 0
-        if number < 0:
-            print("  数字不能小于 0，请重新输入。")
+        # float("nan") 和 float("inf") 虽然能转换成功，
+        # 但不是真正可用于分析的有限数字，必须拒绝
+        if not math.isfinite(number):
+            print("  请输入有限数字，不能输入 nan 或 inf。")
+            continue
+
+        # 检查数字是否处于指定范围
+        if number < min_value:
+            print(f"  数字不能小于 {min_value}，请重新输入。")
+            continue
+
+        if max_value is not None and number > max_value:
+            print(f"  数字不能大于 {max_value}，请重新输入。")
             continue
 
         # 能走到这里，说明输入合法，返回这个数字
@@ -166,17 +187,18 @@ def get_user_input():
     """
     从命令行获取用户今天的行为数据。
 
-    会依次询问四个问题：
+    会依次询问七个问题：
     1. 今天学习了几小时
     2. 今天玩游戏多少分钟
     3. 今天完成了几个任务
     4. 今天与桌宠互动了几次
+    5. 今日心情、精力、压力各为几分（1～5）
 
     每个问题都会做合法性检查：
     - 输入非数字会提示重新输入
     - 输入负数会提示重新输入
 
-    返回值：一个字典，包含四项数据
+    返回值：一个字典，包含四项行为数据和三项主观状态数据
     """
 
     print("=" * 40)
@@ -196,6 +218,20 @@ def get_user_input():
     # 询问今天与桌宠互动了几次（必须是整数）
     interactions = ask_positive_number("今天与桌宠互动了几次？ ", allow_decimal=False)
 
+    print("\n请根据真实感受，为下面三项打 1～5 分：")
+    mood = ask_positive_number(
+        "今日心情（1=很差，5=很好）： ",
+        allow_decimal=False, min_value=1, max_value=5
+    )
+    energy = ask_positive_number(
+        "今日精力（1=很疲惫，5=很充沛）： ",
+        allow_decimal=False, min_value=1, max_value=5
+    )
+    stress = ask_positive_number(
+        "今日压力（1=很轻松，5=压力很大）： ",
+        allow_decimal=False, min_value=1, max_value=5
+    )
+
     print()
 
     # 把收集到的数据整理成字典，方便后续使用
@@ -203,7 +239,10 @@ def get_user_input():
         "study_hours": study_hours,
         "game_minutes": game_minutes,
         "tasks_completed": tasks_completed,
-        "interactions": interactions
+        "interactions": interactions,
+        "mood": mood,
+        "energy": energy,
+        "stress": stress
     }
 
     return user_data
@@ -312,6 +351,100 @@ def determine_status(study_index, activity_index, interaction_index):
         return "低活跃"
 
 
+def infer_user_state(user_data, historical_records):
+    """
+    根据主观评分、当日行为和近期历史推断用户状态。
+
+    这里使用透明、可解释的规则，而不是假装成医学诊断或黑盒 AI。
+    返回的结果可直接交给上层桌宠界面使用。
+    """
+
+    mood = user_data["mood"]
+    energy = user_data["energy"]
+    stress = user_data["stress"]
+    reasons = []
+
+    # 压力优先级最高；其次是明显疲惫；状态良好时判断为充实
+    if stress >= 4:
+        state = "压力偏高"
+        reasons.append(f"今日压力评分为 {stress}/5")
+    elif energy <= 2:
+        state = "疲惫"
+        reasons.append(f"今日精力评分仅为 {energy}/5")
+    elif mood >= 4 and energy >= 4 and stress <= 2:
+        state = "充实"
+        reasons.append("心情和精力较好，且当前压力较低")
+    else:
+        state = "平稳"
+        reasons.append("今日各项主观状态处于正常波动范围")
+
+    # 补充当日行为依据，让结果不只依赖一次主观评分
+    if user_data["study_hours"] >= 6 and energy <= 3:
+        reasons.append("学习时间较长，同时精力偏低")
+    if user_data["tasks_completed"] >= 3 and mood >= 3:
+        reasons.append("今日完成了多项任务")
+
+    # 旧版记录没有三个主观字段，因此只使用字段完整的近期记录
+    valid_history = [
+        record for record in historical_records
+        if all(key in record for key in ("mood", "energy", "stress"))
+    ]
+    valid_history.sort(key=lambda record: record.get("date", ""))
+    recent_history = valid_history[-3:]
+
+    if recent_history:
+        avg_energy = sum(record["energy"] for record in recent_history) / len(recent_history)
+        avg_stress = sum(record["stress"] for record in recent_history) / len(recent_history)
+
+        if energy <= avg_energy - 1:
+            reasons.append("今日精力比近期平均水平明显下降")
+        if stress >= avg_stress + 1:
+            reasons.append("今日压力比近期平均水平明显上升")
+
+    response_table = {
+        "压力偏高": {
+            "pet_reaction": "comfort",
+            "recommendation": {
+                "type": "relax",
+                "title": "进行十分钟放松",
+                "difficulty": 1
+            }
+        },
+        "疲惫": {
+            "pet_reaction": "rest",
+            "recommendation": {
+                "type": "rest",
+                "title": "暂时离开屏幕休息二十分钟",
+                "difficulty": 1
+            }
+        },
+        "充实": {
+            "pet_reaction": "celebrate",
+            "recommendation": {
+                "type": "review",
+                "title": "记录一件今天最有成就感的事",
+                "difficulty": 1
+            }
+        },
+        "平稳": {
+            "pet_reaction": "encourage",
+            "recommendation": {
+                "type": "focus",
+                "title": "完成一次二十五分钟专注任务",
+                "difficulty": 2
+            }
+        }
+    }
+
+    result = response_table[state]
+    return {
+        "state": state,
+        "reasons": reasons,
+        "pet_reaction": result["pet_reaction"],
+        "recommendation": result["recommendation"]
+    }
+
+
 # ============================================================
 # 第三部分：数据存储
 # ============================================================
@@ -333,7 +466,7 @@ def find_today_index(records, today):
     for i in range(len(records)):
 
         # 这条记录的日期和今天相同，说明今天已经有记录了
-        if records[i]["date"] == today:
+        if records[i].get("date") == today:
             return i
 
     # 循环结束都没找到，返回 -1 表示今天没有记录
@@ -357,10 +490,19 @@ def load_data():
         # 返回一个包含空记录列表的字典
         return {"records": []}
 
-    # 文件存在，读取它
-    # encoding="utf-8" 确保中文不会乱码
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    # 文件存在，读取它。损坏时停止运行，避免覆盖原文件。
+    try:
+        with open(DATA_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as error:
+        print(f"数据文件读取失败：{error}")
+        print("为保护已有数据，本次不会继续保存。")
+        return None
+
+    if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+        print("数据文件格式无效：缺少 records 列表。")
+        print("为保护已有数据，本次不会继续保存。")
+        return None
 
     return data
 
@@ -380,11 +522,12 @@ def save_data(data):
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
 
-    # 将数据写入 JSON 文件
-    # ensure_ascii=False 让中文正常显示
-    # indent=2 让文件内容有缩进，方便人类阅读
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
+    # 先写临时文件，再原子替换正式文件。
+    # 即使写入过程中断，也不容易破坏上一份有效数据。
+    temporary_file = DATA_FILE + ".tmp"
+    with open(temporary_file, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(temporary_file, DATA_FILE)
 
 
 # ============================================================
@@ -465,21 +608,24 @@ def calculate_consecutive_days(records):
     if len(records) == 0:
         return 0
 
+    # 使用排序后的副本，不修改原列表，也不依赖文件中的原有顺序
+    ordered_records = sorted(records, key=lambda record: record["date"])
+
     # 连续天数先记为 1，代表最近这一天的记录
     consecutive = 1
 
     # i 是当前检查的记录下标，从最后一条（最近的一天）开始
-    i = len(records) - 1
+    i = len(ordered_records) - 1
 
     # 只要前面还有记录，就继续往前检查
     while i >= 1:
 
         # 把当前这条记录的日期文字，转换成日期对象
         # strptime 的意思是：按 "%Y-%m-%d" 的格式解读文字
-        current_date = datetime.strptime(records[i]["date"], "%Y-%m-%d").date()
+        current_date = datetime.strptime(ordered_records[i]["date"], "%Y-%m-%d").date()
 
         # 把前一条记录的日期文字，也转换成日期对象
-        previous_date = datetime.strptime(records[i - 1]["date"], "%Y-%m-%d").date()
+        previous_date = datetime.strptime(ordered_records[i - 1]["date"], "%Y-%m-%d").date()
 
         # 两个日期相减，得到相差的天数
         difference = (current_date - previous_date).days
@@ -523,12 +669,15 @@ def calculate_trend(records, field_name):
     if len(records) < 4:
         return None
 
-    # 记录按时间先后保存，列表末尾是最近的记录
+    # 使用排序后的副本，确保列表末尾确实是最近记录
+    ordered_records = sorted(records, key=lambda record: record["date"])
+
+    # 记录按时间先后排列，列表末尾是最近的记录
     # records[-3:] 表示"列表最后 3 条"，也就是最近 3 天的记录
-    recent_records = records[-3:]
+    recent_records = ordered_records[-3:]
 
     # records[:-3] 表示"去掉最后 3 条后剩下的"，也就是此前的记录
-    earlier_records = records[:-3]
+    earlier_records = ordered_records[:-3]
 
     # 计算最近 3 天的平均值
     recent_total = 0
@@ -802,7 +951,7 @@ def update_pet_data(pet, xp_change, intimacy_change):
 
 
 def show_pet_status(pet, daily_xp_change, daily_intimacy_change,
-                    old_level, new_level):
+                    old_level, new_level, is_correction=False):
     """
     显示"桌宠状态"区域。
 
@@ -831,7 +980,10 @@ def show_pet_status(pet, daily_xp_change, daily_intimacy_change,
           f"（{daily_intimacy_change:+d}）")
 
     print()
-    print(f"今日获得 XP：{daily_xp_change}")
+    if is_correction:
+        print(f"本次数据修正：{daily_xp_change:+d} XP")
+    else:
+        print(f"今日获得 XP：{daily_xp_change}")
 
     # 更新后的等级数字比更新前大，说明这次运行升级了
     if new_level > old_level:
@@ -865,9 +1017,9 @@ def main():
     执行流程：
     1. 获取用户输入（带合法性检查）
     2. 计算三个指标
-    3. 判断今日状态
+    3. 加载历史数据，推断今日综合状态
     4. 整理今天的完整记录
-    5. 加载历史数据和桌宠数据
+    5. 加载桌宠数据
     6. 如果今天已有记录，询问用户是否覆盖
     7. 计算今日 XP 和亲密度，更新桌宠成长数据
     8. 保存数据（行为记录和桌宠数据一起保存）
@@ -888,13 +1040,31 @@ def main():
     )
     interaction_index = calculate_interaction_index(user_data["interactions"])
 
-    # ---- 第三步：判断今日状态 ----
-    status = determine_status(study_index, activity_index, interaction_index)
+    # ---- 第三步：加载历史数据并推断状态 ----
+    # 原有三个指数得到的是“行为活跃状态”；V0.4 的综合状态还会结合
+    # 心情、精力、压力及近期记录，两者分别保存，避免概念混淆。
+    behavior_status = determine_status(
+        study_index, activity_index, interaction_index
+    )
 
-    # ---- 第四步：整理今天的完整记录 ----
     # 获取今天的日期，格式如 "2026-08-25"
     today = datetime.now().strftime("%Y-%m-%d")
 
+    data = load_data()
+    if data is None:
+        pause_before_exit()
+        return
+
+    records = data["records"]
+    today_index = find_today_index(records, today)
+
+    # 覆盖时不能把旧的“今天”当成历史依据，否则会重复比较自己
+    historical_records = [
+        record for record in records if record.get("date") != today
+    ]
+    state_result = infer_user_state(user_data, historical_records)
+
+    # ---- 第四步：整理今天的完整记录 ----
     # 把原始数据和计算结果整理成一条完整记录
     today_record = {
         "date": today,
@@ -902,23 +1072,23 @@ def main():
         "game_minutes": user_data["game_minutes"],
         "tasks_completed": user_data["tasks_completed"],
         "interactions": user_data["interactions"],
+        "mood": user_data["mood"],
+        "energy": user_data["energy"],
+        "stress": user_data["stress"],
         "study_index": study_index,
         "activity_index": activity_index,
         "interaction_index": interaction_index,
-        "status": status
+        "status": behavior_status,
+        "inferred_state": state_result["state"],
+        "state_reasons": state_result["reasons"],
+        "recommendation": state_result["recommendation"],
+        "pet_reaction": state_result["pet_reaction"]
     }
 
     # ---- 第五步：加载历史数据和桌宠数据 ----
-    data = load_data()
-    records = data["records"]
-
     # 获取桌宠数据
     # 如果是旧版本数据文件（没有 pet 字段），会自动创建默认数据
     pet = load_pet_data(data)
-
-    # 查找今天的记录在列表中的位置
-    # 返回 -1 表示今天还没有记录
-    today_index = find_today_index(records, today)
 
     # 记录"覆盖前的旧记录"
     # 覆盖时需要先扣掉旧记录对应的成长值，再加上新数据的，
@@ -988,7 +1158,17 @@ def main():
     print(f"学习指数：{study_index}")
     print(f"活跃指数：{activity_index}")
     print(f"互动指数：{interaction_index}")
-    print(f"今日状态：{status}")
+    print(f"行为活跃状态：{behavior_status}")
+    print()
+    print(f"今日心情：{user_data['mood']} / 5")
+    print(f"今日精力：{user_data['energy']} / 5")
+    print(f"今日压力：{user_data['stress']} / 5")
+    print(f"综合状态：{state_result['state']}")
+    print("判断依据：")
+    for reason in state_result["reasons"]:
+        print(f"  - {reason}")
+    print(f"今日建议：{state_result['recommendation']['title']}")
+    print(f"桌宠反应：{state_result['pet_reaction']}")
     print("=" * 40)
 
     # 根据刚才的处理方式，给用户一个明确的提示
@@ -1002,7 +1182,8 @@ def main():
 
     # ---- 第九步：显示桌宠状态（V0.3 新增）----
     show_pet_status(pet, daily_xp_change, daily_intimacy_change,
-                    old_level, new_level)
+                    old_level, new_level,
+                    is_correction=(old_record is not None))
 
     # ---- 第十步：显示历史表现分析 ----
     show_historical_analysis(data["records"])
